@@ -1,5 +1,13 @@
 # Virtual Environment
 venv/
 
+# models
+models/
+
+# data
+data/
+
 # Python cache
 __pycache__/
+
+.DS_Store
