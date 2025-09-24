@@ -1,23 +1,26 @@
 """
-preprocessing.py - Functions for cleaning and preparing point clouds.
+preprocessing.py - Functions for cleaning and preparing ProcessedVignette objects.
 
 This module provides a pipeline to filter noise, remove outliers, and prepare
-the point cloud for abstraction algorithms.
+the point cloud for abstraction algorithms. It follows a functional approach,
+taking a raw vignette as input and returning a new, cleaned vignette as output.
 """
 import open3d as o3d
 import numpy as np
 from typing import Optional
 
-def preprocess_point_cloud(
-    pcd: o3d.geometry.PointCloud,
-    confidence_values: np.ndarray,
+# Import our custom data structure
+from pipeline.vignette_data import ProcessedVignette
+
+def preprocess_vignette(
+    raw_vignette: ProcessedVignette,
     confidence_threshold: int = 1,
-    voxel_size: float = 0.005,
+    voxel_size: float = 0.01,
     sor_nb_neighbors: int = 20,
     sor_std_ratio: float = 2.0
-) -> Optional[o3d.geometry.PointCloud]:
+) -> Optional[ProcessedVignette]:
     """
-    Runs a multi-step preprocessing pipeline on a point cloud.
+    Runs a multi-step preprocessing pipeline on a ProcessedVignette.
 
     The pipeline consists of:
     1. Filtering out points below a certain confidence level.
@@ -26,53 +29,84 @@ def preprocess_point_cloud(
     4. Estimating normals, which are required for many abstraction algorithms.
 
     Args:
-        pcd: The raw input Open3D PointCloud.
-        confidence_values: A NumPy array of confidence values (0, 1, or 2)
-                           corresponding to each point in the pcd.
-        confidence_threshold: The minimum confidence value to keep (e.g., 1 means
-                              0 will be removed).
-        voxel_size: The size of the grid for downsampling.
+        raw_vignette: The input ProcessedVignette object containing raw point data.
+        confidence_threshold: The minimum confidence value to keep.
+        voxel_size: The size of the grid for downsampling (in meters).
         sor_nb_neighbors: The number of neighbors to analyze for outlier removal.
-        sor_std_ratio: The standard deviation ratio for outlier removal. Higher
-                       values are less aggressive.
+        sor_std_ratio: The standard deviation ratio for outlier removal.
 
     Returns:
-        The cleaned and preprocessed Open3D PointCloud, or None if the
-        input is invalid.
+        A new, cleaned, and preprocessed ProcessedVignette object, or None if an
+        error occurred.
     """
-    if len(pcd.points) == 0 or len(pcd.points) != len(confidence_values):
-        print("Error: Point cloud is empty or confidence values mismatch.")
+    if raw_vignette.points is None or len(raw_vignette.points) == 0:
+        print("Error: Input vignette is empty.")
+        return None
+    if raw_vignette.confidence is None:
+        print("Error: Input vignette is missing confidence data for filtering.")
+        return None
+    if len(raw_vignette.points) != len(raw_vignette.confidence):
+        print("Error: Point cloud and confidence values mismatch.")
         return None
 
     # --- 1. Confidence Filtering ---
-    # Keep only the points with confidence >= threshold.
-    print(f"Initial points: {len(pcd.points)}")
-    indices_to_keep = np.where(confidence_values >= confidence_threshold)[0]
-    pcd_conf_filtered = pcd.select_by_index(indices_to_keep)
-    print(f"Points after confidence filtering: {len(pcd_conf_filtered.points)}")
+    # We create a boolean mask of which points to keep.
+    print(f"Initial points: {len(raw_vignette.points)}")
+    keep_mask = raw_vignette.confidence >= confidence_threshold
+    
+    # Apply the mask to all per-point attributes
+    points_conf_filtered = raw_vignette.points[keep_mask]
+    colors_conf_filtered = raw_vignette.colors[keep_mask]
+    
+    # Create a temporary Open3D point cloud for the next steps
+    pcd_for_processing = o3d.geometry.PointCloud()
+    pcd_for_processing.points = o3d.utility.Vector3dVector(points_conf_filtered)
+    pcd_for_processing.colors = o3d.utility.Vector3dVector(colors_conf_filtered)
+    
+    print(f"Points after confidence filtering: {len(pcd_for_processing.points)}")
+    if len(pcd_for_processing.points) == 0:
+        print("Warning: No points left after confidence filtering.")
+        return None
 
     # --- 2. Voxel Downsampling ---
-    # This makes the point cloud uniform and more efficient to process.
-    pcd_downsampled = pcd_conf_filtered.voxel_down_sample(voxel_size)
+    pcd_downsampled = pcd_for_processing.voxel_down_sample(voxel_size)
     print(f"Points after downsampling: {len(pcd_downsampled.points)}")
 
     # --- 3. Statistical Outlier Removal (SOR) ---
-    # This is the key step for removing "flying pixels" and noise.
-    print("Removing statistical outliers...")
-    pcd_cleaned, ind = pcd_downsampled.remove_statistical_outlier(
+    pcd_cleaned, _ = pcd_downsampled.remove_statistical_outlier(
         nb_neighbors=sor_nb_neighbors,
         std_ratio=sor_std_ratio
     )
     print(f"Points after outlier removal: {len(pcd_cleaned.points)}")
 
     # --- 4. Normal Estimation ---
-    # Normals describe the orientation of the surface at each point.
-    # They are essential for many mesh and plane fitting algorithms.
-    print("Estimating normals...")
     pcd_cleaned.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
     )
     pcd_cleaned.orient_normals_consistent_tangent_plane(100)
+    print("Normals estimated.")
+
+    # --- 5. Reconcile Custom Attributes ---
+    # The number of points has changed. We need to find the confidence values
+    # for the points that survived the cleaning process.
+    # We use a KDTree for an efficient nearest neighbor search.
+    print("Reconciling custom attributes...")
+    pcd_tree = o3d.geometry.KDTreeFlann(pcd_for_processing)
     
-    print("Preprocessing complete.")
-    return pcd_cleaned
+    cleaned_confidences = []
+    # For each point in our final clean cloud, find its original index
+    for point in pcd_cleaned.points:
+        [k, idx, _] = pcd_tree.search_knn_vector_3d(point, 1)
+        # Get the confidence value from the original confidence-filtered array
+        cleaned_confidences.append(raw_vignette.confidence[keep_mask][idx[0]])
+
+    # --- 6. Create the new, clean ProcessedVignette object ---
+    processed_vignette = ProcessedVignette(
+        points=np.asarray(pcd_cleaned.points),
+        colors=np.asarray(pcd_cleaned.colors),
+        normals=np.asarray(pcd_cleaned.normals),
+        confidence=np.array(cleaned_confidences)
+    )
+    
+    print("Preprocessing complete. Returning new clean vignette.")
+    return processed_vignette
