@@ -9,3 +9,4 @@ torch
 timm
 opencv-python
 coremltools; sys_platform == 'darwin'
+pyransac3d
