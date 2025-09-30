@@ -17,19 +17,36 @@ from scipy.spatial import ConvexHull
 from .vignette_data import ProcessedVignette
 
 
-def project_points_to_2d(points_3d, intrinsics, original_image_size, target_image_size):
+def project_points_to_2d(points_3d, intrinsics):
     """
-    Projects 3D points to 2D image coordinates and scales them to the original image size.
+    Projects 3D points (in original camera space) to 2D image coordinates.
+    
+    MATH: This function implements the standard camera projection matrix formula.
+    The intrinsic matrix (K) maps 3D camera coordinates [X, Y, Z] to
+    homogeneous 2D image coordinates [u*d, v*d, d]. By dividing by the third
+    component (d, which is the depth), we get the final pixel coordinates [u, v].
+    
+    Args:
+        points_3d: An (N, 3) NumPy array of 3D points.
+        intrinsics: The 3x3 camera intrinsic matrix.
+
+    Returns:
+        An (N, 2) NumPy array of 2D pixel coordinates.
     """
+    print(f"      - Projecting {len(points_3d)} points using intrinsics:\n{intrinsics.round(2)}")
+    # Project points onto the image plane
     projected = intrinsics @ points_3d.T
-    d = projected[2, :] + 1e-6
+    
+    # Get the depth value (d) for each point
+    d = projected[2, :] + 1e-6 # Add epsilon to avoid division by zero
+    
+    # Normalize to get final pixel coordinates (u, v)
     u = projected[0, :] / d
     v = projected[1, :] / d
     
-    x_scale = original_image_size[0] / target_image_size[0]
-    y_scale = original_image_size[1] / target_image_size[1]
-    
-    return np.vstack((u * x_scale, v * y_scale)).T
+    result_2d = np.vstack((u, v)).T
+    print(f"      - Raw 2D pixel coordinates (first corner):\n{result_2d[0].round(2)}")
+    return result_2d
 
 
 def create_textured_planes(
@@ -42,18 +59,6 @@ def create_textured_planes(
 
     This is a simplified implementation for debugging. It textures each plane
     mesh using the full, original RGB image. It does NOT crop or create masks.
-
-    For each plane, this function:
-    1. Defines the 3D mesh for the plane's rectangular bounds.
-    2. Projects the 3D corner vertices into the 2D image space.
-    3. Calculates UV coordinates for these corners relative to the full image size.
-    4. Stores the mesh geometry (vertices, UVs) and a path to the ORIGINAL
-       texture in the vignette's metadata.
-
-    Args:
-        vignette: The vignette, which must have 'planes' in its metadata.
-        rgb_image_path: The file path to the original, full-resolution RGB image.
-        output_dir: The directory where the vignette is stored.
     """
     print("--- Starting SIMPLIFIED Textured Plane Creation (Full Image Method) ---")
     vignette.clear_abstractions('textured_planes', auto_save=False)
@@ -75,14 +80,12 @@ def create_textured_planes(
 
     capture_meta = vignette.metadata.get('capture_metadata', {})
     intrinsics = np.array(capture_meta.get('camera_intrinsics', {}).get('columns', np.identity(3))).T
-    target_res = capture_meta.get('resolution', original_image_size)
-    target_image_size = (target_res[0], target_res[1])
     center_offset = np.array(capture_meta.get('center_offset', [0,0,0]))
 
     if np.array_equal(intrinsics, np.identity(3)) or np.allclose(center_offset, [0,0,0]):
          print("   - ERROR: Camera intrinsics or center_offset not found in vignette metadata.")
          return
-    print(f"   - Successfully loaded camera intrinsics, resolution, and center_offset: {center_offset.round(2)}")
+    print(f"   - Successfully loaded camera intrinsics and center_offset: {center_offset.round(2)}")
     
     textured_planes_list = []
 
@@ -104,21 +107,25 @@ def create_textured_planes(
         v2 = center - major_axis*major_half + minor_axis*minor_half
         v3 = center - major_axis*major_half - minor_axis*minor_half
         v4 = center + major_axis*major_half - minor_axis*minor_half
-        # These vertices are in the CENTERED coordinate space for the final vignette.
         corners_3d_centered = np.array([v1, v2, v3, v4])
-        print("   - Calculated 4 corner vertices for the 3D mesh.")
+        print(f"   - Calculated 4 centered 3D corner vertices (first corner):\n{corners_3d_centered[0].round(3)}")
 
         # === Step 3: Calculate UV Coordinates ===
         print("[Step 3/5] Calculating UV coordinates...")
-        # To get the correct UVs, we must project the UN-CENTERED 3D corners.
+        # MATH: To get the correct UVs, we must project the UN-CENTERED 3D corners.
+        # We add the center_offset back to the vertices to place them in their
+        # original position relative to the camera before projection.
         corners_3d_original = corners_3d_centered + center_offset
-        corners_2d = project_points_to_2d(corners_3d_original, intrinsics, original_image_size, target_image_size)
+        print(f"   - Un-centered 3D corners by adding offset (first corner):\n{corners_3d_original[0].round(3)}")
+        
+        # Project the original-space 3D points to get 2D pixel coordinates.
+        corners_2d = project_points_to_2d(corners_3d_original, intrinsics)
         
         # MATH: UV coordinates are normalized, where (0,0) is the top-left of the
         # texture and (1,1) is the bottom-right. We divide the 2D pixel coordinates
         # by the full image dimensions to get these normalized values.
         uv_corners = corners_2d / np.array(original_image_size)
-        print(f"   - Calculated UV coordinates for 4 corners (relative to full image):\n{uv_corners.round(3)}")
+        print(f"   - Normalized 2D pixel coordinates to get final UVs (first corner):\n{uv_corners[0].round(3)}")
         
         # === Step 4: Store Final Data in Vignette ===
         print("[Step 4/5] Storing textured plane data in vignette metadata...")
