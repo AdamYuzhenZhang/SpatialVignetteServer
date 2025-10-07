@@ -200,7 +200,7 @@ class ProcessedVignette:
         )
         
         instance.file_path = Path(file_path)
-        print(f"Saved processed vignette from: {file_path}")
+        print(f"Loaded processed vignette from: {file_path}")
         return instance
 
 

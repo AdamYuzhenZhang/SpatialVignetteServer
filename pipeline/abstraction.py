@@ -9,6 +9,7 @@ import open3d as o3d
 import numpy as np
 from typing import Optional, List, Dict, Any
 from sklearn.cluster import DBSCAN
+from sklearn.decomposition import PCA
 import pyransac3d as pyrsc
 
 # Import our custom data structure
@@ -470,3 +471,120 @@ def stylize_colors(
     # 3. Use vignette.set_attribute(f'colors_{style}', new_color_array, auto_save=False).
     pass
 
+
+
+###### PCA ######
+
+# identify components with DBSCAN
+def identify_components(
+    vignette: ProcessedVignette,
+    cluster_eps: float = 0.05,
+    min_cluster_points: int = 50,
+    auto_save: bool = False
+) -> int:
+    """
+    Identifies distinct geometric components in the vignette using DBSCAN clustering.
+
+    This function adds a 'component_id' per-point attribute to the vignette,
+    where -1 represents noise points.
+    """
+    print(f"Identifying components with eps={cluster_eps}...")
+    
+    clustering = DBSCAN(eps=cluster_eps, min_samples=min_cluster_points).fit(vignette.points)
+    labels = clustering.labels_
+    
+    # Store the result as a per-point attribute in the vignette
+    vignette.set_attribute('component_id', labels, auto_save=auto_save)
+    
+    unique_labels = set(labels)
+    num_components = len(unique_labels) - (1 if -1 in unique_labels else 0)
+    
+    print(f"   - Found {num_components} components and assigned 'component_id' attribute.")
+    return num_components
+
+# PCA
+def _compute_pca_properties(points: np.ndarray) -> Optional[Dict[str, Any]]:
+    """
+    Helper to compute PCA and derive high-level structural properties.
+    """
+    if points.shape[0] < 3:
+        return None
+        
+    pca = PCA(n_components=3)
+    pca.fit(points)
+    
+    # Eigenvalues are the variances. Sort them to be safe.
+    variances = np.sort(pca.explained_variance_)[::-1]
+    l1, l2, l3 = variances
+    
+    # --- Calculate High-Level Metrics (Normalized 0-1) ---
+    # These formulas are standard for 3D shape analysis.
+    # We check for l1 > 0 to avoid division by zero on tiny point clusters.
+    if l1 > 0:
+        linearity = (l1 - l2) / l1
+        planarity = (l2 - l3) / l1
+        sphericity = l3 / l1
+        anisotropy = (l1 - l3) / l1 # Overall measure of directionality
+    else:
+        linearity, planarity, sphericity, anisotropy = 0.0, 0.0, 0.0, 0.0
+
+    # Package into a serializable dictionary
+    properties = {
+        'centroid': pca.mean_.tolist(),
+        'axes': pca.components_.tolist(), # Eigenvectors
+        'variances': pca.explained_variance_.tolist(), # Eigenvalues
+        # High-level abstractions:
+        'linearity': linearity,
+        'planarity': planarity,
+        'sphericity': sphericity,
+        'anisotropy': anisotropy,
+    }
+    return properties
+
+
+def analyze_structural_properties(vignette: ProcessedVignette, auto_save: bool = False) -> None:
+    """
+    Analyzes the vignette using PCA to extract high-level structural properties.
+
+    Stores detailed information including centroid, axes (eigenvectors), variances
+    (eigenvalues), and derived metrics like linearity, planarity, and sphericity as
+    floats between 0 and 1.
+    """
+    print("Analyzing structural properties with PCA...")
+    vignette.clear_abstractions('structural_properties', auto_save=False)
+    
+    # --- 1. Global Properties ---
+    global_props = _compute_pca_properties(vignette.points)
+    if global_props:
+        global_props['type'] = 'global'
+        vignette.add_abstraction('structural_properties', global_props, auto_save=False)
+        print(f"   - Global properties: L={global_props['linearity']:.2f}, P={global_props['planarity']:.2f}, S={global_props['sphericity']:.2f}")
+
+    # --- 2. Component Properties ---
+    component_labels = vignette.get_attribute('component_id')
+    if component_labels is None:
+        print("   - Skipping component PCA: 'component_id' not found.")
+        return
+    unique_labels = set(component_labels)
+    # Calculate the actual number of components
+    num_components = len(unique_labels)
+    if num_components <= 1:
+        print(f"   - Skipping per-component analysis ({num_components} component found).")
+        return
+
+    print(f"   - Analyzing {num_components} components...")
+    for label in sorted(list(unique_labels)):
+        if label == -1: continue # Skip noise
+        
+        component_points = vignette.points[component_labels == label]
+        component_props = _compute_pca_properties(component_points)
+        
+        if component_props:
+            component_props['type'] = 'component'
+            component_props['component_id'] = int(label)
+            print(f"     - Component #{label}: L={component_props['linearity']:.2f}, P={component_props['planarity']:.2f}, S={component_props['sphericity']:.2f}")
+            vignette.add_abstraction('structural_properties', component_props, auto_save=False)
+            
+    if auto_save and vignette.file_path:
+        vignette.save()
+    print("Finished structural property analysis.")

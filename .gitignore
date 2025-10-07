@@ -3,6 +3,7 @@ venv/
 
 # models
 models/
+checkpoints/
 
 # data
 data/
