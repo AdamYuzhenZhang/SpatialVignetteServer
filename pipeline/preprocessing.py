@@ -4,6 +4,8 @@ preprocessing.py - Functions for cleaning and preparing ProcessedVignette object
 import open3d as o3d
 import numpy as np
 from typing import Optional, Dict
+from sklearn.cluster import DBSCAN
+from sklearn.neighbors import NearestNeighbors
 
 # Import our custom data structure
 from pipeline.vignette_data import ProcessedVignette
@@ -13,30 +15,12 @@ def preprocess_vignette(
     confidence_threshold: int = 1,
     voxel_size: float = 0.01,
     sor_nb_neighbors: int = 20,
-    sor_std_ratio: float = 2.0
+    sor_std_ratio: float = 2.0,
+    use_voxel_downsampling: bool = True,
+    save_path: Optional[str] = None,
 ) -> Optional[ProcessedVignette]:
     """
     Runs a multi-step preprocessing pipeline on a ProcessedVignette.
-
-    This function is designed to be robust and future-proof. It automatically handles
-    any and all per-point attributes present in the raw vignette.
-
-    The pipeline consists of:
-    1. (Optional) Filtering points below a confidence threshold, if confidence data exists.
-    2. Downsampling the point cloud to make it uniform and efficient.
-    3. Removing statistical outliers (effective against "flying pixels").
-    4. Estimating normals, required for many abstraction algorithms.
-
-    Args:
-        raw_vignette: The input ProcessedVignette object containing raw point data.
-        confidence_threshold: The minimum confidence value to keep (used if 'confidence' attribute exists).
-        voxel_size: The size of the grid for downsampling (in meters).
-        sor_nb_neighbors: The number of neighbors for statistical outlier removal.
-        sor_std_ratio: The standard deviation ratio for outlier removal.
-
-    Returns:
-        A new, cleaned, and preprocessed ProcessedVignette object, or None if the
-        input vignette is empty.
     """
     if raw_vignette.n_points == 0:
         print("Error: Input vignette is empty.")
@@ -75,8 +59,12 @@ def preprocess_vignette(
     pcd_pre_downsample.colors = o3d.utility.Vector3dVector(colors)
 
     # --- 2. Voxel Downsampling ---
-    print(f"Downsampling with voxel size: {voxel_size}...")
-    pcd_downsampled = pcd_pre_downsample.voxel_down_sample(voxel_size)
+    if use_voxel_downsampling:
+        print(f"Downsampling with voxel size: {voxel_size}...")
+        pcd_downsampled = pcd_pre_downsample.voxel_down_sample(voxel_size)
+    else:
+        print("Skipping vocel downsampling...")
+        pcd_downsampled = pcd_pre_downsample
     print(f"Points after downsampling: {len(pcd_downsampled.points)}")
 
     # --- 3. Statistical Outlier Removal (SOR) ---
@@ -128,6 +116,54 @@ def preprocess_vignette(
         # Unpack the dictionary of final, reconciled attributes
         **final_attributes
     )
+
+    if save_path is not None:
+        processed_vignette.save(save_path)
+        print(f"Saved vignette to {save_path}")
+    else:
+        print("Vignette not saved.")
     
     print("--- Preprocessing complete. Returning new clean vignette. ---")
     return processed_vignette
+
+
+# Suggest the optimum cluster_eps for DBSCAN
+# May use this as a starting value, and let use tweak it
+def suggest_eps(
+    vignette: ProcessedVignette, 
+    k=8, 
+    percentile=90
+):
+    points = vignette.points
+    nbrs = NearestNeighbors(n_neighbors=k).fit(points)
+    dists, _ = nbrs.kneighbors(points)
+    # mean distance to k neighbors per point
+    dk = dists[:, -1] # kth neighbor distance
+    return np.percentile(dk, percentile)
+
+# identify components with DBSCAN
+def identify_components(
+    vignette: ProcessedVignette,
+    cluster_eps: float = 0.05,  # Maximum neighborhood radius to consider points neighbors
+    min_cluster_points: int = 50, # Minimum neighbors 
+    auto_save: bool = False
+) -> int:
+    """
+    Identifies distinct geometric components in the vignette using DBSCAN clustering.
+
+    This function adds a 'component_id' per-point attribute to the vignette,
+    where -1 represents noise points.
+    """
+    print(f"Identifying components with eps={cluster_eps}...")
+    
+    clustering = DBSCAN(eps=cluster_eps, min_samples=min_cluster_points).fit(vignette.points)
+    labels = clustering.labels_
+    
+    # Store the result as a per-point attribute in the vignette
+    vignette.set_attribute('component_id', labels, auto_save=auto_save)
+    
+    unique_labels = set(labels)
+    num_components = len(unique_labels) - (1 if -1 in unique_labels else 0)
+    
+    print(f"   - Found {num_components} subcomponents and assigned 'component_id' attribute.")
+    return num_components

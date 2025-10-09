@@ -6,7 +6,7 @@ from PIL import Image
 
 from pipeline.vignette_data import ProcessedVignette
 
-def create_masked_point_cloud(vignette_path: Path):
+def create_masked_point_cloud(vignette_path: Path, stride: int = 1):
     """
     Creates a ProcessedVignette object from raw data, including points, colors,
     and confidence values, and saves it to a single .npz file.
@@ -68,7 +68,15 @@ def create_masked_point_cloud(vignette_path: Path):
 
     # 5. Apply the resized mask to the depth data to isolate the object of interest
     mask_np = np.array(mask_img_resized) > 127
-    depth_image_np[~mask_np] = 0.0
+
+    if stride > 1:
+        yy, xx = np.indices((depth_height, depth_width))
+        stride_mask = (yy % stride == 0) & (xx % stride == 0)
+    else:
+        stride_mask = np.ones((depth_height, depth_width), dtype=bool)
+
+    eff_mask = mask_np & stride_mask
+    depth_image_np[~eff_mask] = 0.0
 
     # 6. Create Open3D structures for point cloud generation
     o3d_color = o3d.geometry.Image(np.array(color_img_resized))
@@ -86,9 +94,8 @@ def create_masked_point_cloud(vignette_path: Path):
     pcd.translate(-center)
     print(f"Generated and centered point cloud with {len(pcd.points)} points.")
     
-    # --- NEW: Store the centering vector in the metadata ---
-    # This is crucial for correctly un-doing the translation during texturing.
-    capture_metadata['center_offset'] = center.tolist()
+    capture_metadata['center_offset'] = center.tolist() # Store centering vector for undo translation during texturing
+    capture_metadata['sampling_stride'] = int(stride) # Store the stride we sampled
     
     # 8. Extract final data arrays for our ProcessedVignette
     points = np.asarray(pcd.points)
@@ -97,7 +104,10 @@ def create_masked_point_cloud(vignette_path: Path):
     attributes = {}
     
     if confidence_map_np is not None:
-        valid_confidences = confidence_map_np[mask_np]
+        valid_depth_mask = depth_image_np > 0
+        point_mask = eff_mask & valid_depth_mask
+        valid_confidences = confidence_map_np[point_mask]
+
         if len(valid_confidences) == len(points):
             attributes['confidence'] = valid_confidences
         else:
