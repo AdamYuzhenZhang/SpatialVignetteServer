@@ -3,7 +3,7 @@ vignette_data.py - Defines a custom, intelligent data structure for processed vi
 """
 import numpy as np
 import open3d as o3d
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple, Literal
 from pathlib import Path
 import matplotlib.cm as cm
 
@@ -131,6 +131,24 @@ class ProcessedVignette:
             
         if auto_save and self.file_path:
             self.save()
+    
+    # --- Other metadata properties ---
+
+    def set_metadata_property(self, property_name: str, property_data: Any, auto_save: bool = True):
+        """
+        Sets or updates a single top-level property in the vignette's metadata.
+        This is ideal for singular properties like a color palette or summary statistics.
+        Args:
+            property_name: The key for the metadata property (e.g., 'color_palette').
+            property_data: The data to store (e.g., a dictionary or list).
+            auto_save: If True, saves the vignette after modification.
+        """
+        self.metadata[property_name] = property_data
+        print(f"Set/updated metadata property: '{property_name}'.")
+        
+        if auto_save and self.file_path:
+            self.save()
+
 
     def save(self, file_path: Optional[str] = None):
         """
@@ -250,4 +268,78 @@ class ProcessedVignette:
                 print(f"Warning: Attribute '{color_mode}' not found. Defaulting to gray.")
                 pcd.paint_uniform_color([0.5, 0.5, 0.5])
                 
+        return pcd
+    
+
+    Direction = Literal["above", "below", "between"]
+    def to_open3d_threshold(
+        self,
+        attr: str,
+        threshold: float | Tuple[float, float],
+        direction: Direction = "above",
+        inclusive: bool = True,
+        use_abs: bool = False,
+        return_mask: bool = False,
+    ) -> o3d.geometry.PointCloud | tuple[o3d.geometry.PointCloud, np.ndarray]:
+        """
+        Create an Open3D point cloud that keeps only points whose attribute value
+        passes a threshold test. Colors are **always** the stored RGB.
+        """
+        # --- Fetch attribute values ---
+        values = self.get_attribute(attr)
+        if values is None:
+            raise ValueError(f"Attribute '{attr}' not found on this vignette.")
+        values = np.asarray(values)
+        if values.shape[0] != self.points.shape[0]:
+            raise ValueError(
+                f"Attribute '{attr}' length ({values.shape[0]}) "
+                f"does not match number of points ({self.points.shape[0]})."
+            )
+
+        # --- Build mask ---
+        vals = np.abs(values) if use_abs else values
+        if direction == "between":
+            if not (isinstance(threshold, (tuple, list)) and len(threshold) == 2):
+                raise ValueError("For direction='between', threshold must be a (low, high) tuple.")
+            lo, hi = float(threshold[0]), float(threshold[1])
+            if lo > hi:
+                lo, hi = hi, lo  # swap to keep sane
+            if inclusive:
+                mask = (vals >= lo) & (vals <= hi)
+            else:
+                mask = (vals >  lo) & (vals <  hi)
+        elif direction == "above":
+            t = float(threshold)
+            mask = (vals >= t) if inclusive else (vals > t)
+        elif direction == "below":
+            t = float(threshold)
+            mask = (vals <= t) if inclusive else (vals < t)
+        else:
+            raise ValueError("direction must be 'above', 'below', or 'between'.")
+
+        # --- Apply mask to data ---
+        if not np.any(mask):
+            # Return an empty point cloud (and mask if requested)
+            pcd_empty = o3d.geometry.PointCloud()
+            if return_mask:
+                return pcd_empty, mask
+            return pcd_empty
+
+        pts = self.points[mask]
+        cols = self.colors[mask]
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+
+        # normals optional
+        if getattr(self, "normals", None) is not None and len(self.normals) == len(self.points):
+            pcd.normals = o3d.utility.Vector3dVector(self.normals[mask])
+
+        # Open3D expects float colors in [0,1]
+        cols = np.asarray(cols, dtype=np.float32)
+        if cols.max() > 1.0:  # if your pipeline stored 0-255, normalize
+            cols = cols / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(cols)
+
+        if return_mask:
+            return pcd, mask
         return pcd
