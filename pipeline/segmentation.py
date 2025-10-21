@@ -193,3 +193,23 @@ def apply_threshold_to_logits(logits_path: Path, threshold: float, output_path: 
     Image.fromarray(mask, mode="L").save(mask_path)
     print(f"[sam] Wrote mask: {mask_path}")
     return mask_path
+
+
+def create_full_mask(rgb_image_path: Path, output_path: Path) -> Path:
+    """
+    Creates a full-image mask from an RGB image based on brightness threshold.
+    """
+    _ensure_dir(Path(output_path))
+    
+    # Load image and convert to grayscale
+    rgb = Image.open(rgb_image_path).convert("L")
+    width, height = rgb.size
+
+    # Create binary mask
+    mask = np.ones((height, width), dtype=np.uint8) * 255
+
+    # Save mask
+    mask_path = Path(output_path) / "mask.png"
+    Image.fromarray(mask, mode="L").save(mask_path)
+    print(f"[mask] Wrote full-image mask: {mask_path}")
+    return mask_path

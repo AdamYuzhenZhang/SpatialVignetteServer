@@ -36,6 +36,7 @@ def create_masked_point_cloud(vignette_path: Path, stride: int = 1):
         
         depth_height, depth_width = capture_metadata['resolution'][1], capture_metadata['resolution'][0]
         target_size = (depth_width, depth_height)
+        print(f"[DEBUG] Depth target size (W,H): {target_size}")
 
         color_img_raw = Image.open(rgb_path).convert("RGB")
         mask_img_raw = Image.open(mask_path).convert("L")
@@ -43,7 +44,14 @@ def create_masked_point_cloud(vignette_path: Path, stride: int = 1):
         depth_data = np.fromfile(depth_path, dtype=np.float32)
         depth_image_np = depth_data.reshape((depth_height, depth_width))
 
+        print("[DEBUG] Depth stats:",
+               f"shape={depth_image_np.shape}",
+               f"min={np.nanmin(depth_image_np):.6f}",
+               f"max={np.nanmax(depth_image_np):.6f}",
+               f"nz={(depth_image_np>0).sum()}")
+        
         intrinsics_matrix = np.array(capture_metadata['camera_intrinsics']['columns']).T
+        print("[DEBUG] Intrinsics (raw):\n", intrinsics_matrix)
 
         confidence_map_np = None
         if confidence_path.exists():
@@ -61,7 +69,10 @@ def create_masked_point_cloud(vignette_path: Path, stride: int = 1):
     x_scale, y_scale = depth_width / original_width, depth_height / original_height
     fx, fy, cx, cy = intrinsics_matrix[0, 0], intrinsics_matrix[1, 1], intrinsics_matrix[0, 2], intrinsics_matrix[1, 2]
     scaled_fx, scaled_fy, scaled_cx, scaled_cy = fx * x_scale, fy * y_scale, cx * x_scale, cy * y_scale
-    
+    print(f"[DEBUG] Image original size (W,H): {(original_width, original_height)}")
+    print(f"[DEBUG] Scale factors: x={x_scale:.4f}, y={y_scale:.4f}")
+    print(f"[DEBUG] Intrinsics (scaled): fx={scaled_fx:.4f}, fy={scaled_fy:.4f}, cx={scaled_cx:.4f}, cy={scaled_cy:.4f}")
+
     # 4. Resize images to match depth map dimensions
     color_img_resized = color_img_raw.resize(target_size, Image.Resampling.BILINEAR)
     mask_img_resized = mask_img_raw.resize(target_size, Image.Resampling.NEAREST)
@@ -76,13 +87,15 @@ def create_masked_point_cloud(vignette_path: Path, stride: int = 1):
         stride_mask = np.ones((depth_height, depth_width), dtype=bool)
 
     eff_mask = mask_np & stride_mask
+    if eff_mask.sum() == 0:
+        print("Warning: Effective mask is empty after threshold/stride. No points will be produced.")
     depth_image_np[~eff_mask] = 0.0
 
     # 6. Create Open3D structures for point cloud generation
     o3d_color = o3d.geometry.Image(np.array(color_img_resized))
     o3d_depth = o3d.geometry.Image(depth_image_np)
     rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
-        o3d_color, o3d_depth, depth_scale=1.0, depth_trunc=10.0, convert_rgb_to_intensity=False
+        o3d_color, o3d_depth, depth_scale=1.0, depth_trunc=1e3, convert_rgb_to_intensity=False
     )
     o3d_intrinsics = o3d.camera.PinholeCameraIntrinsic(
         depth_width, depth_height, scaled_fx, scaled_fy, scaled_cx, scaled_cy
@@ -94,14 +107,30 @@ def create_masked_point_cloud(vignette_path: Path, stride: int = 1):
     pcd.translate(-center)
     print(f"Generated and centered point cloud with {len(pcd.points)} points.")
     
+    capture_metadata['original_resolution'] = [original_width, original_height]
     capture_metadata['center_offset'] = center.tolist() # Store centering vector for undo translation during texturing
     capture_metadata['sampling_stride'] = int(stride) # Store the stride we sampled
     
+    # New Store UVs!
+    print("   - Calculating and storing UV coordinates...")
+    # Get the pixel coordinates (y, x) of all valid points from the mask
+    # The order of points in `pcd` corresponds to a row-major scan of the depth image.
+    valid_y, valid_x = np.where(eff_mask & (depth_image_np > 0))
+
+    # Normalize these coordinates based on the original, full-resolution image size
+    # We use (size - 1) for correct mapping from a 0-indexed pixel to a 0-1 float range.
+    normalized_u = valid_x / (depth_width - 1)
+    normalized_v = valid_y / (depth_height - 1)
+    
+    # Combine into a (N, 2) array of [u, v] coordinates
+    uv_coords = np.stack((normalized_u, normalized_v), axis=-1)
+
     # 8. Extract final data arrays for our ProcessedVignette
     points = np.asarray(pcd.points)
     colors = np.asarray(pcd.colors)
     
-    attributes = {}
+    #attributes = {}
+    attributes = {'uv_coords': uv_coords}
     
     if confidence_map_np is not None:
         valid_depth_mask = depth_image_np > 0

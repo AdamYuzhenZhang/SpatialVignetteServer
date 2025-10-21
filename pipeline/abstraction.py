@@ -90,6 +90,8 @@ def analyze_local_features(
 # --- 2.2 Abstraction from 2D RGB Image ---
 
 # Creating 2D processed images
+
+'''
 def generate_edge_map(
     rgb_path: str, 
     mask_path: str, 
@@ -123,6 +125,66 @@ def generate_edge_map(
     
     cv2.imwrite(output_path, dilated_edges)
     return output_path
+'''
+# New version removing the edge of mask
+import cv2
+import numpy as np
+from pathlib import Path
+
+def generate_edge_map(
+    rgb_path: str,
+    mask_path: str,
+    output_path: str,
+    canny_thresh1: int = 100,
+    canny_thresh2: int = 200,
+    mask_erosion_kernel_size: int = 5,
+    dilation_kernel_size: int = 3,
+    dilation_iterations: int = 1
+) -> str:
+    """
+    Generates a binary edge map, then uses an eroded mask to remove the
+    unwanted boundary edge from the result.
+
+    Args:
+        ... (args are the same)
+        mask_erosion_kernel_size: The size of the kernel to erode the mask. This
+                                  controls how much of the border is removed.
+                                  Must be odd. Set to 0 to disable.
+    """
+    print(f"Generating edge map and removing boundary -> {Path(output_path).name}")
+    rgb_img = cv2.imread(rgb_path)
+    mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+    # --- 1. Generate All Edges First ---
+    # Apply the ORIGINAL mask to get all edges, including the boundary.
+    gray_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2GRAY)
+    masked_gray = cv2.bitwise_and(gray_img, gray_img, mask=mask_img)
+    all_edges = cv2.Canny(masked_gray, canny_thresh1, canny_thresh2)
+
+    # --- 2. Create the "Safe Zone" Mask ---
+    # Erode the original mask to create a new mask that is slightly smaller.
+    # This eroded mask defines the area where we want to KEEP edges.
+    if mask_erosion_kernel_size > 0:
+        print(f"   - Eroding mask with kernel size {mask_erosion_kernel_size}x{mask_erosion_kernel_size} to create safe zone...")
+        erosion_kernel = np.ones((mask_erosion_kernel_size, mask_erosion_kernel_size), np.uint8)
+        eroded_mask = cv2.erode(mask_img, erosion_kernel, iterations=1)
+    else:
+        eroded_mask = mask_img
+
+    # --- 3. Filter The Edges ---
+    # Use the eroded mask as a "cookie cutter" to remove any edges that
+    # fall outside the safe zone. This effectively removes the boundary edge.
+    internal_edges = cv2.bitwise_and(all_edges, all_edges, mask=eroded_mask)
+
+    # --- 4. Thicken the Remaining Edges (Optional) ---
+    if dilation_kernel_size > 0:
+        kernel = np.ones((dilation_kernel_size, dilation_kernel_size), np.uint8)
+        final_edges = cv2.dilate(internal_edges, kernel, iterations=dilation_iterations)
+    else:
+        final_edges = internal_edges
+
+    cv2.imwrite(output_path, final_edges)
+    return output_path
 
 def generate_detail_map(rgb_path: str, mask_path: str, output_path: str) -> str:
     """
@@ -146,6 +208,79 @@ def generate_detail_map(rgb_path: str, mask_path: str, output_path: str) -> str:
     cv2.imwrite(output_path, normalized_img)
     return output_path
 
+
+def generate_probability_map_from_detail(
+    rgb_path: str,
+    mask_path: str,
+    output_path: str,
+    ksize_laplacian: int = 5,
+    contrast_power: float = 0.5,
+    blur_ksize: int = 31
+) -> str:
+    """
+    Generates a smoothed, high-contrast grayscale map representing the "strength of detail,"
+    ideal for use as a probability map.
+
+    Args:
+        rgb_path: Path to the source RGB image.
+        mask_path: Path to the mask image.
+        output_path: The file path to save the final probability map.
+        ksize_laplacian: The kernel size for the Laplacian filter. A smaller value
+                         (e.g., 3) is more sensitive to fine noise. A larger value
+                         (e.g., 7) captures more significant edges. Must be odd.
+        contrast_power: A power to apply for contrast enhancement. Values < 1.0
+                        (e.g., 0.5) will brighten faint details. Values > 1.0 will
+                        make only the strongest details stand out.
+        blur_ksize: The kernel size for the Gaussian blur. This smooths the map
+                    into broader regions, making it less noisy. Must be odd.
+
+    Returns:
+        The path to the saved probability map image.
+    """
+    print(f"Generating probability map from detail -> {Path(output_path).name}")
+    rgb_img = cv2.imread(rgb_path)
+    mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    
+    # --- 1. Calculate Raw Detail with Tunable Kernel ---
+    gray_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2GRAY)
+    masked_gray = cv2.bitwise_and(gray_img, gray_img, mask=mask_img)
+
+    # Use the tunable ksize for the Laplacian filter
+    laplacian_img = np.abs(cv2.Laplacian(masked_gray, cv2.CV_64F, ksize=ksize_laplacian))
+    
+    # --- 2. Normalize, Amplify, and Smooth the Map ---
+    
+    # a) Normalize the raw detail map to a floating-point range of 0-1
+    float_map = np.zeros_like(laplacian_img, dtype=np.float64)
+    if laplacian_img.max() > 0:
+        float_map = cv2.normalize(laplacian_img, None, 0.0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_64F)
+
+    # b) Amplify the signal using a power function for contrast
+    # This is key to making faint details more visible
+    contrast_map = np.power(float_map, contrast_power)
+    
+    # c) Smooth the map to create broader, less noisy regions
+    # 
+    if blur_ksize > 0:
+        blurred_map = cv2.GaussianBlur(contrast_map, (blur_ksize, blur_ksize), 0)
+    else:
+        blurred_map = contrast_map
+        
+    # --- 3. Finalize and Save the Processed Map ---
+    
+    # Re-apply the mask to ensure the background is pure black after blurring
+    final_map_float = cv2.bitwise_and(blurred_map, blurred_map, mask=mask_img)
+
+    # Normalize the final 0-1 float map to a 0-255 uint8 range for saving as an image
+    if final_map_float.max() > 0:
+        final_map_uint8 = cv2.normalize(final_map_float, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    else:
+        final_map_uint8 = np.zeros_like(final_map_float, dtype=np.uint8)
+
+    cv2.imwrite(output_path, final_map_uint8)
+    print(f"   - Saved smoothed probability map to {output_path}")
+    return output_path
+
 def generate_stylized_image(
     rgb_path: str, 
     mask_path: str, 
@@ -153,25 +288,52 @@ def generate_stylized_image(
     k: int
 ) -> str:
     """
-    Generates a stylized version of the image using K-Means color quantization.
+    Generates a stylized version of the image using K-Means color quantization,
+    intelligently analyzing ONLY the pixels within the provided mask.
     """
     print(f"Generating {k}-color stylized image -> {Path(output_path).name}")
     rgb_img = cv2.imread(rgb_path)
     mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+    # --- 1. Isolate Object Pixels for Analysis ---
+    # Create a boolean mask where True corresponds to the object.
+    # We use > 0 to be safe, but > 127 is also common for binary masks.
+    object_mask = mask_img > 0
+
+    # Use the boolean mask to select only the pixels from the RGB image
+    # that are part of the object.
+    object_pixels = rgb_img[object_mask]
     
-    masked_img = cv2.bitwise_and(rgb_img, rgb_img, mask=mask_img)
-    pixels = masked_img.reshape((-1, 3)).astype(np.float32)
-    
+    # If there are no pixels in the mask, return a black image.
+    if object_pixels.shape[0] == 0:
+        print("   [Warning] No object pixels found in the mask. Output will be black.")
+        cv2.imwrite(output_path, np.zeros_like(rgb_img))
+        return output_path
+
+    # Reshape for k-means and convert to float32
+    pixels_for_kmeans = object_pixels.reshape((-1, 3)).astype(np.float32)
+
+    # --- 2. Run K-Means ONLY on Object Pixels ---
+    # The algorithm now only sees the true colors of the object.
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    _, labels, centers = cv2.kmeans(pixels, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    _, labels, centers = cv2.kmeans(pixels_for_kmeans, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
     
     centers = np.uint8(centers)
-    stylized_pixels = centers[labels.flatten()]
-    stylized_img = stylized_pixels.reshape(rgb_img.shape)
+    # The result contains the new stylized colors for ONLY the object pixels.
+    stylized_object_pixels = centers[labels.flatten()]
+
+    # --- 3. Reconstruct the Final Image ---
+    # Start with a completely black image that has the same dimensions as the original.
+    stylized_img = np.zeros_like(rgb_img)
+
+    # Use the same boolean mask to place the stylized object pixels
+    # back into their correct locations on the black canvas.
+    stylized_img[object_mask] = stylized_object_pixels.reshape((-1, 3))
     
     cv2.imwrite(output_path, stylized_img)
     return output_path
 
+'''
 # Applying 2D images to 3D points
 def apply_feature_map_to_vignette(
     vignette: 'ProcessedVignette',
@@ -243,6 +405,48 @@ def apply_feature_map_to_vignette(
     # Set the new attribute regardless of its shape
     vignette.set_attribute(attribute_name, sampled_values, auto_save=auto_save)
     print(f"   - Set attribute '{attribute_name}' with shape {sampled_values.shape}.")
+    return vignette
+'''
+
+# Using stored UV here
+def apply_feature_map_to_vignette(
+    vignette: 'ProcessedVignette',
+    feature_map_path: str,
+    attribute_name: str
+) -> 'ProcessedVignette':
+    """
+    Applies a 2D feature map to a vignette by sampling it using the
+    vignette's pre-stored UV coordinates.
+    """
+    print(f"Applying feature map '{Path(feature_map_path).name}' using stored UVs...")
+    
+    # 1. Load the feature map
+    feature_img = cv2.imread(feature_map_path, cv2.IMREAD_UNCHANGED)
+    if feature_img is None:
+        raise IOError(f"Could not load feature map from {feature_map_path}")
+    
+    img_height, img_width = feature_img.shape[:2]
+
+    # 2. Get the stored UV coordinates from the vignette
+    uv_coords = vignette.get_attribute('uv_coords')
+    if uv_coords is None:
+        raise ValueError("Vignette is missing the 'uv_coords' attribute. Please regenerate it using the new creation script.")
+
+    # 3. De-normalize the UVs to get pixel coordinates in the feature map
+    # We multiply by (size - 1) to correctly map back to 0-indexed pixels
+    u_pixel = (uv_coords[:, 0] * (img_width - 1)).astype(int)
+    v_pixel = (uv_coords[:, 1] * (img_height - 1)).astype(int)
+
+    # 4. Sample the feature image at the calculated pixel coordinates
+    if feature_img.ndim == 3: # Color image
+        sampled_values = np.zeros((vignette.n_points, 3), dtype=np.float64)
+        sampled_colors_bgr = feature_img[v_pixel, u_pixel]
+        sampled_values = cv2.cvtColor(sampled_colors_bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB).reshape(-1, 3) / 255.0
+    else: # Grayscale image
+        sampled_values = feature_img[v_pixel, u_pixel].astype(np.float64) / 255.0
+
+    # 5. Set the new attribute
+    vignette.set_attribute(attribute_name, sampled_values)
     return vignette
 
 # extract color palette from rgb image
@@ -612,6 +816,7 @@ def _make_new_plane_from_noise_if_large(
         return [noise_idx]
     return []
 
+'''
 def _region_growing_plane_segmentation(
     points_subset: np.ndarray,
     global_indices_of_subset: np.ndarray,
@@ -754,6 +959,156 @@ def _region_growing_plane_segmentation(
     else:
         print(f"\n     [DEBUG] Total planes found in this subset: {len(found)}")
     return found
+'''
+
+def _region_growing_plane_segmentation(
+    points_subset: np.ndarray,
+    global_indices_of_subset: np.ndarray,
+    *,
+    normal_search_radius: float,
+    normal_max_nn: int = 30,
+    normal_angle_tolerance_deg: float = 15.0,
+    min_samples_normals_ratio: float = 0.10,
+    plane_distance_eps: float,
+    min_points_per_plane: int,
+    refinement_method: str = "pca",
+    ransac_max_iterations: int = 500,
+    noise_strategy_layer: str = "force_assign",
+    assign_unassigned_to_closest_plane: bool = True
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Performs region-growing based plane segmentation with an optional final pass
+    to assign noise points to their closest valid plane.
+    """
+    N = len(points_subset)
+    if N < max(3, min_points_per_plane):
+        return []
+
+    # 1) Normals
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_subset)
+    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=normal_search_radius, max_nn=normal_max_nn))
+    pcd.orient_normals_consistent_tangent_plane(k=min(30, N))
+    normals = np.asarray(pcd.normals, dtype=np.float64)
+
+    # 2) Canonicalize normals to point in a consistent direction
+    normals_unit = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12)
+    ref_normal = np.mean(normals_unit, axis=0)
+    ref_normal /= (np.linalg.norm(ref_normal) + 1e-12)
+    flip_mask = (normals_unit @ ref_normal) < 0.0
+    normals_unit[flip_mask] *= -1.0
+
+    # 3) Orientation clustering (DBSCAN on unit normals)
+    eps_normals = 2.0 * np.sin(np.deg2rad(normal_angle_tolerance_deg) / 2.0)
+    min_samples_normals = max(min_points_per_plane, int(N * float(min_samples_normals_ratio)))
+    labels_orient = DBSCAN(eps=eps_normals, min_samples=min_samples_normals).fit(normals_unit).labels_
+    unique_labels = np.unique(labels_orient)
+
+    found_planes: list[tuple[np.ndarray, np.ndarray]] = []
+
+    # 4) For each orientation group, find parallel planes
+    for label in unique_labels:
+        if label == -1:
+            continue
+
+        group_idx_local = np.where(labels_orient == label)[0]
+        if group_idx_local.size < min_points_per_plane:
+            continue
+
+        group_pts = points_subset[group_idx_local]
+        
+        # Use PCA to get the robust average normal for this orientation group
+        pca = PCA(n_components=3)
+        pca.fit(group_pts)
+        proj_normal = pca.components_[2]
+
+        # Split the group into parallel planes (subclusters)
+        subclusters_local, noise_idx_local, s_vals = _split_by_offset_along_normal(
+            group_pts, proj_normal, plane_distance_eps, min_points_per_plane
+        )
+
+        # Handle points considered noise by the 1D split
+        if noise_strategy_layer == "new_plane":
+            new_from_noise = _make_new_plane_from_noise_if_large(noise_idx_local, min_points_per_plane)
+            if new_from_noise:
+                subclusters_local.extend(new_from_noise)
+                noise_idx_local = np.array([], dtype=int)
+            subclusters_local = _assign_noise_points_to_layers(
+                s_vals, noise_idx_local, subclusters_local, plane_distance_eps, "merge"
+            )
+        elif noise_strategy_layer in ("force_assign", "merge"):
+            subclusters_local = _assign_noise_points_to_layers(
+                s_vals, noise_idx_local, subclusters_local, plane_distance_eps, noise_strategy_layer
+            )
+        
+        # Refine and store each final plane
+        for sub_idx_local in subclusters_local:
+            sub_pts = group_pts[sub_idx_local]
+            
+            if refinement_method.lower() == "ransac" and PYRANSAC_AVAILABLE:
+                fitter = pyrsc.Plane()
+                plane_eq, inlier_local = fitter.fit(sub_pts, thresh=plane_distance_eps, maxIteration=ransac_max_iterations)
+                n = plane_eq[:3]
+                plane_eq = np.array([*(n / (np.linalg.norm(n) + 1e-12)), plane_eq[3]], dtype=np.float64)
+            else: # Default to PCA
+                plane_eq = _fit_plane_with_pca(sub_pts)
+                inlier_local = np.arange(len(sub_pts))
+
+            if len(inlier_local) < min_points_per_plane:
+                continue
+
+            # Map local indices back to global indices
+            final_in_subgroup_idx = sub_idx_local[inlier_local]
+            final_in_group_idx = group_idx_local[final_in_subgroup_idx]
+            global_inliers = global_indices_of_subset[final_in_group_idx]
+
+            found_planes.append((plane_eq, global_inliers))
+
+    # 5) FINAL STEP: Optionally assign unassigned points to the closest found plane
+    if assign_unassigned_to_closest_plane and found_planes:
+        unassigned_idx_local = np.where(labels_orient == -1)[0]
+        
+        if unassigned_idx_local.size > 0:
+            unassigned_pts = points_subset[unassigned_idx_local]
+            num_unassigned = len(unassigned_pts)
+            num_planes = len(found_planes)
+            
+            plane_equations = np.array([p[0] for p in found_planes])
+            
+            # Calculate distance from each unassigned point to each plane
+            dists = np.abs(unassigned_pts @ plane_equations[:, :3].T + plane_equations[:, 3])
+            
+            # Find the closest plane and its distance for each point
+            closest_plane_indices = np.argmin(dists, axis=1)
+            min_dists = dists[np.arange(num_unassigned), closest_plane_indices]
+            
+            # Filter points that are within the threshold of their closest plane
+            assignment_mask = min_dists <= plane_distance_eps
+            
+            points_to_assign_indices = unassigned_idx_local[assignment_mask]
+            planes_to_receive_indices = closest_plane_indices[assignment_mask]
+            
+            # Efficiently group points to be added to each plane
+            additions = [[] for _ in range(num_planes)]
+            for i in range(len(points_to_assign_indices)):
+                local_idx = points_to_assign_indices[i]
+                plane_idx = planes_to_receive_indices[i]
+                global_idx = global_indices_of_subset[local_idx]
+                additions[plane_idx].append(global_idx)
+            
+            # Update the inlier lists for the planes with the new points
+            num_reassigned = 0
+            for i, plane_additions in enumerate(additions):
+                if plane_additions:
+                    plane_eq, old_inliers = found_planes[i]
+                    new_inliers = np.concatenate((old_inliers, np.array(plane_additions, dtype=old_inliers.dtype)))
+                    found_planes[i] = (plane_eq, new_inliers)
+                    num_reassigned += len(plane_additions)
+            
+            print(f"     [INFO] Reassigned {num_reassigned} / {num_unassigned} unassigned points to nearest planes.")
+    
+    return found_planes
+
 
 
 # Go through component ids and run RANSAC on each one
